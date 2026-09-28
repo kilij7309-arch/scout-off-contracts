@@ -150,6 +150,11 @@ pub enum VerificationError {
     /// `tally_dispute` called before the voting window closes and the
     /// required quorum of votes has not yet been reached.
     QuorumNotReached = 43,
+
+    // ── Jury eligibility (issue #1375) ──
+    /// `cast_dispute_vote` called by a validator registered after the dispute
+    /// was filed (jury_eligibility_cutoff). Pre-filing validators only.
+    NotEligibleJuror = 44,
 }
 
 impl AdminError for VerificationError {

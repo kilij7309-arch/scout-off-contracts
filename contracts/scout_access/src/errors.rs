@@ -134,6 +134,12 @@ pub enum ScoutAccessError {
     /// `admin_revoke_evidence_access` targeted a (player_id, scout) pair for
     /// which no `EvidenceAccessGrant` record exists.
     GrantNotFound = 38,
+
+    // ── Tier access enforcement (issue #1357) ──
+    /// `pay_to_contact` or `batch_contact_players` called by a Basic-tier scout,
+    /// or by a Pro-tier scout attempting to contact a Level-3 player.
+    /// Basic tier has no contact entitlement; Pro tier is capped at Level 2.
+    TierNotPermitted = 39,
 }
 
 impl AdminError for ScoutAccessError {

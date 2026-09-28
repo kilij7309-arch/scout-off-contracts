@@ -46,6 +46,7 @@ mod progress_contract {
             player_id: u64,
             milestone_ref: u32,
         ) -> Result<ProgressLevel, ProgClientError>;
+        fn get_level(env: Env, player_id: u64) -> ProgressLevel;
     }
 }
 
@@ -1001,6 +1002,10 @@ impl ScoutAccessContract {
 
         let config = Self::fee_config(&env);
 
+        // #1357: enforce subscription tier × player-level access matrix.
+        // Basic tier has no contact entitlement. Pro tier cannot contact Level-3 players.
+        Self::check_tier_level_access(&env, &subscription.tier, player_id)?;
+
         // Pro-tier quota enforcement: limit contacts to pro_contact_limit per
         // subscription period.  The counter resets automatically on renewal
         // because a new period_start is stored when the scout subscribes again.
@@ -1126,6 +1131,11 @@ impl ScoutAccessContract {
         scout.require_auth();
         let sub = Self::require_active_subscription(&env, &scout)?;
 
+        // #1357: Basic tier has no contact entitlement — reject the whole batch.
+        if sub.tier == SubscriptionTier::Basic {
+            return Err(ScoutAccessError::TierNotPermitted);
+        }
+
         let config = Self::fee_config(&env);
         let mut new_contacts: u32 = 0;
 
@@ -1141,6 +1151,10 @@ impl ScoutAccessContract {
                 continue;
             }
             seen.push_back(player_id);
+            // #1357: skip (no charge) players the scout's tier cannot access.
+            if Self::check_tier_level_access(&env, &sub.tier, player_id).is_err() {
+                continue;
+            }
             if !env
                 .storage()
                 .persistent()
@@ -1166,6 +1180,11 @@ impl ScoutAccessContract {
         // Second pass: write contact records and emit events.
         for i in 0..player_ids.len() {
             let player_id = player_ids.get(i).unwrap();
+            // #1357: skip ineligible players (already filtered in first pass; keep skip
+            // here so storage is never written for them).
+            if Self::check_tier_level_access(&env, &sub.tier, player_id).is_err() {
+                continue;
+            }
             let contact_key = DataKey::ContactRecord(player_id, scout.clone());
             if env.storage().persistent().has(&contact_key) {
                 continue;
@@ -2855,6 +2874,55 @@ impl ScoutAccessContract {
             return Err(ScoutAccessError::SubscriptionExpired);
         }
         Ok(sub)
+    }
+
+    /// (#1357) Enforce the documented tier × player-level access matrix:
+    ///
+    /// | Tier  | Contact allowed | Max player level contactable |
+    /// |-------|-----------------|------------------------------|
+    /// | Basic | ❌              | —                            |
+    /// | Pro   | ✅              | PerformanceMilestones (2)     |
+    /// | Elite | ✅              | EliteTier (3)                 |
+    ///
+    /// Returns `TierNotPermitted` when:
+    /// - the scout's tier is Basic (no contact entitlement at all), or
+    /// - the scout's tier is Pro and the player's level is EliteTier.
+    ///
+    /// When the progress contract is not wired the call fails closed
+    /// (returns `TierNotPermitted`) rather than allowing an unverified
+    /// contact. This is the safest default: the progress contract should
+    /// always be wired in production; a missing link is an operator error
+    /// and should not silently grant access.
+    fn check_tier_level_access(
+        env: &Env,
+        tier: &SubscriptionTier,
+        player_id: u64,
+    ) -> Result<(), ScoutAccessError> {
+        use scoutchain_shared_types::ProgressLevel;
+
+        // Basic tier: no contact entitlement whatsoever.
+        if *tier == SubscriptionTier::Basic {
+            return Err(ScoutAccessError::TierNotPermitted);
+        }
+
+        // Pro tier: cannot contact Level-3 (EliteTier) players.
+        if *tier == SubscriptionTier::Pro {
+            let progress_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProgressContract)
+                .ok_or(ScoutAccessError::TierNotPermitted)?; // fail closed when not wired
+
+            let progress_client =
+                progress_contract::Client::new(env, &progress_addr);
+            let level = progress_client.get_level(&player_id);
+            if level == ProgressLevel::EliteTier {
+                return Err(ScoutAccessError::TierNotPermitted);
+            }
+        }
+
+        // Elite tier: may contact any level.
+        Ok(())
     }
 
     fn fee_config(env: &Env) -> FeeConfig {

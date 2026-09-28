@@ -164,6 +164,15 @@ pub struct MilestoneDispute {
     pub votes_for: u32,
     /// Number of votes cast against upholding the dispute.
     pub votes_against: u32,
+    /// Unix timestamp snapshotted at filing time (#1375).
+    /// Only validators whose `registered_at < jury_eligibility_cutoff` may vote,
+    /// preventing a compromised admin from registering new validators mid-vote
+    /// to control the outcome.
+    pub jury_eligibility_cutoff: u64,
+    /// Affiliation of the validator who originally approved the disputed milestone,
+    /// snapshotted at filing time (#1375). Validators with the same affiliation are
+    /// excluded from voting to prevent colleagues from protecting each other.
+    pub approver_affiliation: String,
 }
 
 /// Admin-configurable jury parameters for high-impact milestone disputes.

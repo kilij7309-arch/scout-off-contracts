@@ -514,21 +514,17 @@ impl VerificationContract {
             }
         }
 
-        // Check if we've reached the maximum number of validators
-        let total_count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalValidatorCount)
-            .unwrap_or(0u32);
-        if total_count >= MAX_VALIDATORS {
-            return Err(VerificationError::ValidatorCapReached);
-        }
-
         let mut validator_vector: Vec<Address> = env
             .storage()
             .persistent()
             .get(&DataKey::ValidatorVector)
             .unwrap_or_else(|| Vec::new(&env));
+
+        // Cap is based on the current vector length (active validators) so that
+        // revoking a validator frees a slot for a new registration (#1391).
+        if validator_vector.len() >= MAX_VALIDATORS {
+            return Err(VerificationError::ValidatorCapReached);
+        }
 
         if env
             .storage()
@@ -687,6 +683,18 @@ impl VerificationContract {
                 &DataKey::ActiveValidatorCount,
                 &safe_sub_u32(count, 1).map_err(|_| VerificationError::Overflow)?,
             );
+            // #1391: decrement TotalValidatorCount (mirrors ValidatorVector.len())
+            // so the cap check in register_validator stays consistent. The counter
+            // was only ever incremented on registration, so revoking must undo it.
+            let total: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TotalValidatorCount)
+                .unwrap_or(0u32);
+            env.storage().instance().set(
+                &DataKey::TotalValidatorCount,
+                &safe_sub_u32(total, 1).map_err(|_| VerificationError::Overflow)?,
+            );
         }
 
         let validator_vector: Vec<Address> = env
@@ -741,6 +749,9 @@ impl VerificationContract {
                     .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
                 events::validator_revoked(&env, &admin, &wallet, &reason_str);
                 events::validator_revoked_for_cause(&env, &admin, &wallet, &reason_str);
+                // #1375: for-cause revocation removes the validator's votes from every
+                // open dispute to prevent a revoked bad actor's votes from still counting.
+                Self::remove_dispute_votes_for_validator(&env, &wallet);
                 // Start (or complete) the bounded cascade sweep.
                 Self::run_cascade_sweep(&env, &wallet, 0)?;
             }
@@ -960,10 +971,33 @@ impl VerificationContract {
                 .persistent()
                 .get(&DataKey::Validator(wallet.clone()))
                 .ok_or(VerificationError::ValidatorNotFound)?;
+            let was_active = validator.active;
             validator.active = false;
             env.storage()
                 .persistent()
                 .set(&DataKey::Validator(wallet.clone()), &validator);
+
+            if was_active {
+                let act_count: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ActiveValidatorCount)
+                    .unwrap_or(0u32);
+                env.storage().instance().set(
+                    &DataKey::ActiveValidatorCount,
+                    &safe_sub_u32(act_count, 1).map_err(|_| VerificationError::Overflow)?,
+                );
+                // #1391: decrement TotalValidatorCount so cap reflects vector size.
+                let total: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalValidatorCount)
+                    .unwrap_or(0u32);
+                env.storage().instance().set(
+                    &DataKey::TotalValidatorCount,
+                    &safe_sub_u32(total, 1).map_err(|_| VerificationError::Overflow)?,
+                );
+            }
 
             let validator_vector: Vec<Address> = env
                 .storage()
@@ -1034,11 +1068,14 @@ impl VerificationContract {
         Self::require_initialized(&env)?;
 
         // Preliminary cap check: ensure the batch won't push us over MAX_VALIDATORS.
-        let current_count: u32 = env
+        // Cap is based on the current vector length, not TotalValidatorCount, so revoked
+        // validators free slots for new registrations (#1391).
+        let current_vector: Vec<Address> = env
             .storage()
-            .instance()
-            .get(&DataKey::TotalValidatorCount)
-            .unwrap_or(0u32);
+            .persistent()
+            .get(&DataKey::ValidatorVector)
+            .unwrap_or_else(|| Vec::new(&env));
+        let current_count: u32 = current_vector.len();
         let batch_len = entries.len();
         if safe_add_u32(current_count, batch_len).map_err(|_| VerificationError::Overflow)?
             > MAX_VALIDATORS
@@ -1201,6 +1238,11 @@ impl VerificationContract {
                 .persistent()
                 .get(&DataKey::ValidatorVector)
                 .unwrap_or_else(|| Vec::new(&env));
+            // #1391: check vector cap before re-adding — if 100 new validators
+            // were registered after this one was revoked, there is no room.
+            if validator_vector.len() >= MAX_VALIDATORS {
+                return Err(VerificationError::ValidatorCapReached);
+            }
             let mut already_present = false;
             for i in 0..validator_vector.len() {
                 if validator_vector.get(i).unwrap() == wallet {
@@ -1217,6 +1259,16 @@ impl VerificationContract {
                     &DataKey::ValidatorVector,
                     PERSISTENT_TTL_MIN,
                     PERSISTENT_TTL_MAX,
+                );
+                // #1391: restore the TotalValidatorCount to stay in sync with vector length.
+                let total: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::TotalValidatorCount)
+                    .unwrap_or(0u32);
+                env.storage().instance().set(
+                    &DataKey::TotalValidatorCount,
+                    &safe_add_u32(total, 1).map_err(|_| VerificationError::Overflow)?,
                 );
             }
         }
@@ -2171,10 +2223,17 @@ impl VerificationContract {
             .unwrap_or(0u32)
     }
 
-    /// Returns the total number of registered validators (both active and revoked).
-    /// Useful as a pre-check before calling register_validator to anticipate
-    /// a possible ValidatorCapReached error, since the validator registry is capped
-    /// at MAX_VALIDATORS (100).
+    /// Returns the number of validators currently in the live registry
+    /// (i.e. `ValidatorVector.len()` — active validators only).
+    ///
+    /// This count equals `ActiveValidatorCount` under normal operation.
+    /// The cap check in `register_validator` / `batch_register_validators`
+    /// is also based on this value, so revoking a validator immediately
+    /// frees a slot for a new registration (#1391).
+    ///
+    /// Use `get_active_validator_count` for the same value with the same
+    /// semantics; this function is retained for backward compatibility and
+    /// as the pre-registration cap pre-check described in the README.
     pub fn get_validator_count(env: Env) -> u32 {
         env.storage()
             .instance()
@@ -3021,6 +3080,14 @@ impl VerificationContract {
             0u64
         };
 
+        // #1375: snapshot the approver's affiliation so validators from the
+        // same organisation are excluded from voting (conflict of interest).
+        let approver: Validator = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Validator(milestone.validator.clone()))
+            .ok_or(VerificationError::ValidatorNotFound)?;
+
         let dispute = MilestoneDispute {
             player_id,
             milestone_index,
@@ -3034,14 +3101,13 @@ impl VerificationContract {
             voting_deadline,
             votes_for: 0,
             votes_against: 0,
+            // #1375: only validators registered before this timestamp may vote.
+            jury_eligibility_cutoff: now,
+            approver_affiliation: approver.affiliation.clone(),
         };
 
         // Keep the approver address from the milestone for conflict-of-interest checks.
         // This is read during cast_dispute_vote via the Milestone storage record directly.
-        // Suppress the unused-variable warning — `milestone` was fetched above for
-        // existence validation; the approver address is re-read from storage in
-        // cast_dispute_vote to avoid re-serialising the full record here.
-        let _ = &milestone.validator;
 
         env.storage().persistent().set(&dispute_key, &dispute);
 
@@ -3282,6 +3348,13 @@ impl VerificationContract {
             return Err(VerificationError::VotingWindowClosed);
         }
 
+        // Rule 5 (#1375): validator must have been registered before the dispute
+        // was filed (jury_eligibility_cutoff snapshot). This prevents an admin from
+        // registering new validators mid-vote to control the outcome.
+        if val_record.registered_at >= dispute.jury_eligibility_cutoff {
+            return Err(VerificationError::NotEligibleJuror);
+        }
+
         // Rule 2: validator must not be the original milestone approver.
         let milestone: Milestone = env
             .storage()
@@ -3289,6 +3362,12 @@ impl VerificationContract {
             .get(&DataKey::Milestone(player_id, milestone_index))
             .ok_or(VerificationError::MilestoneNotFound)?;
         if milestone.validator == validator {
+            return Err(VerificationError::ConflictOfInterest);
+        }
+
+        // Rule 6 (#1375): same-affiliation validators are excluded — they share an
+        // organisational conflict of interest with the original approver.
+        if val_record.affiliation == dispute.approver_affiliation {
             return Err(VerificationError::ConflictOfInterest);
         }
 
@@ -3849,6 +3928,56 @@ impl VerificationContract {
     /// (sub-threshold) pending attestation claim it has voted on, called
     /// from `revoke_validator` / `batch_revoke_validators`.
     ///
+    /// (#1375) For-cause revocation: remove `wallet`'s jury votes from every
+    /// currently-open dispute. Scans the `OpenDisputeIndex` (bounded by
+    /// `ActiveDisputesCount`) and for each dispute checks whether a
+    /// `DataKey::DisputeVote(player_id, milestone_index, wallet)` exists.
+    /// When found, the vote is removed and the running tally on the dispute
+    /// record is decremented so `tally_dispute` sees accurate counts.
+    fn remove_dispute_votes_for_validator(env: &Env, wallet: &Address) {
+        let open_index: Vec<(u64, u32)> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OpenDisputeIndex)
+            .unwrap_or_else(|| Vec::new(env));
+
+        for i in 0..open_index.len() {
+            let (player_id, milestone_index) = open_index.get(i).unwrap();
+            let vote_key = DataKey::DisputeVote(player_id, milestone_index, wallet.clone());
+            if let Some(vote) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, DisputeVote>(&vote_key)
+            {
+                env.storage().persistent().remove(&vote_key);
+
+                let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index);
+                if let Some(mut dispute) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, MilestoneDispute>(&dispute_key)
+                {
+                    if !dispute.resolved {
+                        if vote.for_upheld && dispute.votes_for > 0 {
+                            dispute.votes_for -= 1;
+                        } else if !vote.for_upheld && dispute.votes_against > 0 {
+                            dispute.votes_against -= 1;
+                        }
+                        env.storage().persistent().set(&dispute_key, &dispute);
+                        let count_key = DataKey::DisputeVoteCount(player_id, milestone_index);
+                        let count: u32 =
+                            env.storage().persistent().get(&count_key).unwrap_or(0u32);
+                        if count > 0 {
+                            env.storage()
+                                .persistent()
+                                .set(&count_key, &(count - 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Bounded to `MAX_PENDING_VOTES_PER_VALIDATOR` — see
     /// `DataKey::ValidatorPendingVotes` — so this never scans more than a
     /// small constant number of entries regardless of how many claims exist
